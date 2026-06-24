@@ -26,6 +26,7 @@
           @touchmove.stop.prevent="onTouchHandler"
           @touchstart.stop.prevent="onTouchHandler"
           @touchend.stop.prevent="onTouchHandler"
+          @touchcancel.stop.prevent="onTouchHandler"
           @compositionstart="onCompositionStartHandler"
           @compositionend="onCompositionEndHandler"
         />
@@ -682,12 +683,18 @@
     }
 
     sendMousePos(e: MouseEvent) {
+      this.sendMousePosAbsolute(e.clientX, e.clientY)
+    }
+
+    // shared by mouse and touch handlers: map a viewport coordinate to the
+    // remote video resolution and emit a mousemove (same mapping for both).
+    sendMousePosAbsolute(clientX: number, clientY: number) {
       const { w, h } = this.$accessor.video.resolution
       const rect = this._overlay.getBoundingClientRect()
 
       this.$client.sendData('mousemove', {
-        x: Math.round((w / rect.width) * (e.clientX - rect.left)),
-        y: Math.round((h / rect.height) * (e.clientY - rect.top)),
+        x: Math.round((w / rect.width) * (clientX - rect.left)),
+        y: Math.round((h / rect.height) * (clientY - rect.top)),
       })
     }
 
@@ -730,33 +737,114 @@
       }
     }
 
+    // touch-gesture state
+    private touchActive = false // a single-finger press is in progress
+    private touchScrolling = false // a two-finger scroll is in progress
+    private lastTouchX = 0
+    private lastTouchY = 0
+
+    // Translate touch events into the existing mouse/wheel input the server
+    // already understands. Single finger => left-click / drag, two fingers =>
+    // scroll. Touch handlers are additive; desktop mouse paths are untouched.
     onTouchHandler(e: TouchEvent) {
-      let first = e.changedTouches[0]
-      let type = ''
       switch (e.type) {
         case 'touchstart':
-          type = 'mousedown'
+          this.onTouchStart(e)
           break
         case 'touchmove':
-          type = 'mousemove'
+          this.onTouchMove(e)
           break
         case 'touchend':
-          type = 'mouseup'
+        case 'touchcancel':
+          this.onTouchEnd(e)
           break
-        default:
-          return
+      }
+    }
+
+    onTouchStart(e: TouchEvent) {
+      // mirror the mouse permission model: only act while hosting and unlocked
+      if (!this.hosting || this.locked) {
+        return
       }
 
-      const simulatedEvent = new MouseEvent(type, {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-        screenX: first.screenX,
-        screenY: first.screenY,
-        clientX: first.clientX,
-        clientY: first.clientY,
-      })
-      first.target.dispatchEvent(simulatedEvent)
+      // two or more fingers => prepare for a scroll gesture, no click
+      if (e.touches.length >= 2) {
+        // if a single-finger press was already down, release it first so the
+        // left button is never left stuck when a second finger lands
+        if (this.touchActive) {
+          this.$client.sendData('mouseup', { key: 1 })
+        }
+        this.touchActive = false
+        this.touchScrolling = true
+        const { x, y } = this.touchCenter(e.touches)
+        this.lastTouchX = x
+        this.lastTouchY = y
+        return
+      }
+
+      // single finger => move pointer then press the left button
+      const touch = e.changedTouches[0]
+      this.touchActive = true
+      this.touchScrolling = false
+      this.sendMousePosAbsolute(touch.clientX, touch.clientY)
+      this.$client.sendData('mousedown', { key: 1 })
+    }
+
+    onTouchMove(e: TouchEvent) {
+      if (!this.hosting || this.locked) {
+        return
+      }
+
+      // two-finger drag => wheel scroll using the delta between samples
+      if (this.touchScrolling && e.touches.length >= 2) {
+        const { x, y } = this.touchCenter(e.touches)
+        let dx = x - this.lastTouchX
+        let dy = y - this.lastTouchY
+        this.lastTouchX = x
+        this.lastTouchY = y
+
+        if (this.scroll_invert) {
+          dx = dx * -1
+          dy = dy * -1
+        }
+
+        dx = Math.min(Math.max(dx, -this.scroll), this.scroll)
+        dy = Math.min(Math.max(dy, -this.scroll), this.scroll)
+
+        this.$client.sendData('wheel', { x: Math.round(dx), y: Math.round(dy) })
+        return
+      }
+
+      // single finger => drag the pointer (button still held from touchstart)
+      if (this.touchActive) {
+        const touch = e.changedTouches[0]
+        this.sendMousePosAbsolute(touch.clientX, touch.clientY)
+      }
+    }
+
+    onTouchEnd(e: TouchEvent) {
+      // end the scroll gesture once fewer than two fingers remain
+      if (e.touches.length < 2) {
+        this.touchScrolling = false
+      }
+
+      // always release a held left button, even if hosting/locked changed
+      // mid-gesture or the OS cancelled the touch, so it can never stick down
+      if (this.touchActive) {
+        this.touchActive = false
+        this.$client.sendData('mouseup', { key: 1 })
+      }
+    }
+
+    // average position of all active touches, in viewport coordinates
+    touchCenter(touches: TouchList): { x: number; y: number } {
+      let x = 0
+      let y = 0
+      for (let i = 0; i < touches.length; i++) {
+        x += touches[i].clientX
+        y += touches[i].clientY
+      }
+      return { x: x / touches.length, y: y / touches.length }
     }
 
     onCompositionStartHandler() {
